@@ -297,6 +297,8 @@ static void cleanup_client_http(struct ws_client *client)
 
 static void remove_client(struct ws_client *client)
 {
+	wslog("removing client %d\n", client->fd);
+
 	if (close(client->fd) == -1)
 		perror("close");
 
@@ -311,40 +313,6 @@ static void remove_client(struct ws_client *client)
 
 	cleanup_client_http(client);
 	free(client);
-}
-
-static void client_receive(struct ws_client *client)
-{
-	ssize_t ret, parsed;
-	char buf[4096];
-
-	ret = recv(client->fd, buf, sizeof(buf), 0);
-	if (ret == -1) {
-		perror("recv");
-		remove_client(client);
-		return;
-	}
-
-	parsed = http_parser_execute(&client->parser, &parser_settings, buf, ret);
-
-	if (client->parser.upgrade) {
-		/* TODO */
-		wslog("upgrade requested from %d\n", client->fd);
-		remove_client(client);
-		return;
-	}
-	if (parsed != ret) {
-		/* TODO: 400 Bad Request */
-		wslog("request error from %d: %s\n", client->fd,
-		      http_errno_name(HTTP_PARSER_ERRNO(&client->parser)));
-		remove_client(client);
-		return;
-	}
-
-	if (ret == 0) {
-		wslog("done with %d\n", client->fd);
-		remove_client(client);
-	}
 }
 
 static void cleanup_clients(void)
@@ -368,7 +336,6 @@ static int on_url(http_parser *parser, const char *buf, size_t len)
 
 	new_url = realloc(client->url, client->url_len + len + 1);
 	if (!new_url) {
-		/* TODO: 500 Internal Server Error */
 		perror("realloc");
 		return -1;
 	}
@@ -394,7 +361,6 @@ static int on_header_field(http_parser *parser, const char *buf, size_t len)
 		new_headers = realloc(client->headers,
 				      sizeof(struct header) * (client->num_headers + 1));
 		if (!new_headers) {
-			/* TODO: 500 Internal Server Error */
 			perror("realloc");
 			return -1;
 		}
@@ -410,7 +376,6 @@ static int on_header_field(http_parser *parser, const char *buf, size_t len)
 		new_field = realloc(current_header->field,
 				    current_header->field_len + len + 1);
 		if (!new_field) {
-			/* TODO: 500 Internal Server Error */
 			perror("realloc");
 			return -1;
 		}
@@ -448,7 +413,6 @@ static int on_header_value(http_parser *parser, const char *buf, size_t len)
 		new_value = realloc(current_header->value,
 				    current_header->value_len + len + 1);
 		if (!new_value) {
-			/* TODO: 500 Internal Server Error */
 			perror("realloc");
 			return -1;
 		}
@@ -469,7 +433,7 @@ static int on_header_value(http_parser *parser, const char *buf, size_t len)
 	return 0;
 }
 
-static void send_http_response(http_parser *parser, int status_code,
+static int send_http_response(http_parser *parser, int status_code,
 			       char *status_msg, int fd)
 {
 	struct ws_client *client = parser->data;
@@ -496,9 +460,8 @@ static void send_http_response(http_parser *parser, int status_code,
 	if (fd != -1) {
 		ret = fstat(fd, &st);
 		if (ret == -1) {
-			/* TODO */
 			perror("fstat");
-			return;
+			return -1;
 		}
 	}
 
@@ -515,23 +478,23 @@ static void send_http_response(http_parser *parser, int status_code,
 		      http_should_keep_alive(parser) ? "" : "Connection: close\r\n"
 		      );
 	if (ret < 0) {
-		/* TODO */
 		perror("dprintf");
-		return;
+		return -1;
 	}
 
 	while (st.st_size > 0) {
 		sret = sendfile(client->fd, fd, NULL, st.st_size);
 		if (sret == -1) {
-			/* TODO */
 			perror("sendfile");
-			return;
+			return -1;
 		}
 		st.st_size -= sret;
 	}
+
+	return 0;
 }
 
-static void send_http_error(http_parser *parser, int status_code,
+static int send_http_error(http_parser *parser, int status_code,
 			    char *status_msg)
 {
 	char buf[9];
@@ -545,15 +508,17 @@ static void send_http_error(http_parser *parser, int status_code,
 	if (fd == -1)
 		perror("open");
 
-	send_http_response(parser, status_code, status_msg, fd);
+	ret = send_http_response(parser, status_code, status_msg, fd);
 	
 	if (fd != -1) {
 		if (close(fd) == -1)
 			perror("close");
 	}
+
+	return ret;
 }
 
-static void respond_to_client(http_parser *parser)
+static int respond_to_client(http_parser *parser)
 {
 	struct ws_client *client = parser->data;
 	struct http_parser_url url;
@@ -564,15 +529,13 @@ static void respond_to_client(http_parser *parser)
 	int ret;
 
 	if (parser->method != HTTP_GET) {
-		send_http_error(parser, 501, "Not Implemented");
-		return;
+		return send_http_error(parser, 501, "Not Implemented");
 	}
 
 	ret = http_parser_parse_url(client->url, client->url_len,
 				    0, &url);
 	if (ret == -1 || !(url.field_set & (1 << UF_PATH))) {
-		send_http_error(parser, 400, "Bad Request");
-		return;
+		return send_http_error(parser, 400, "Bad Request");
 	}
 
 	url_path = client->url + url.field_data[UF_PATH].off;
@@ -585,8 +548,7 @@ static void respond_to_client(http_parser *parser)
 		 * Just forbid ".." anywhere for now. Either chroot or the
 		 * proposed O_BENEATH flag for open() would make this easier.
 		 */
-		send_http_error(parser, 400, "Bad Request");
-		return;
+		return send_http_error(parser, 400, "Bad Request");
 	}
 
 	assert(url_path[0] == '/');
@@ -596,22 +558,20 @@ static void respond_to_client(http_parser *parser)
 		switch (errno) {
 		case EACCES:
 		case ELOOP:
-			send_http_error(parser, 403, "Forbidden");
-			break;
+			return send_http_error(parser, 403, "Forbidden");
 		case ENOENT:
-			send_http_error(parser, 404, "Not Found");
-			break;
+			return send_http_error(parser, 404, "Not Found");
 		default:
-			send_http_error(parser, 500, "Internal Server Error");
-			break;
+			return send_http_error(parser, 500, "Internal Server Error");
 		}
-		return;
 	}
 
-	send_http_response(parser, 200, "OK", fd);
+	ret = send_http_response(parser, 200, "OK", fd);
 
 	if (close(fd) == -1)
 		perror("close");
+
+	return ret;
 }
 
 static int on_message_complete(http_parser *parser)
@@ -624,9 +584,39 @@ static int on_message_complete(http_parser *parser)
 		wslog("header for %d \"%s: %s\"\n", client->fd,
 		      client->headers[i].field, client->headers[i].value);
 
-	respond_to_client(parser);
+	return respond_to_client(parser);
+}
 
-	return 0;
+static void client_receive(struct ws_client *client)
+{
+	ssize_t ret, parsed;
+	char buf[4096];
+
+	ret = recv(client->fd, buf, sizeof(buf), 0);
+	if (ret == -1) {
+		perror("recv");
+		remove_client(client);
+		return;
+	}
+
+	parsed = http_parser_execute(&client->parser, &parser_settings, buf, ret);
+
+	if (client->parser.upgrade) {
+		send_http_error(&client->parser, 501, "Not Implemented");
+		remove_client(client);
+		return;
+	}
+	if (parsed != ret) {
+		if (HTTP_PARSER_ERRNO(&client->parser) >= HPE_INVALID_EOF_STATE)
+			send_http_error(&client->parser, 400, "Bad Request");
+		else
+			send_http_error(&client->parser, 500, "Internal Server Error");
+		remove_client(client);
+		return;
+	}
+
+	if (ret == 0)
+		remove_client(client);
 }
 
 int main(int argc, char **argv)
