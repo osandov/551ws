@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <ctype.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <fcntl.h>
@@ -518,12 +519,48 @@ static int send_http_error(http_parser *parser, int status_code,
 	return ret;
 }
 
+static void decode_path(char *url_path)
+{
+	char *p = url_path, *q = url_path;
+	uint8_t byte;
+	char h, l;
+
+	while (*p) {
+		if (*p == '%' && (h = *(p + 1)) && (l = *(p + 2)) &&
+		    isxdigit(h) && isxdigit(l)) {
+			if ('a' <= h && h <= 'f')
+				h -= ('a' - 10);
+			else if ('A' <= h && h <= 'F')
+				h -= ('A' - 10);
+			else if ('0' <= h && h <= '9')
+				h -= '0';
+			if ('a' <= l && l <= 'f')
+				l -= ('a' - 10);
+			else if ('A' <= l && l <= 'F')
+				l -= ('A' - 10);
+			else if ('0' <= l && l <= '9')
+				l -= '0';
+			byte = (uint8_t)(h << 4) | (uint8_t)l;
+			if (byte < 0x20 || byte > 0x7e) {
+				*q++ = *p++;
+				*q++ = *p++;
+				*q++ = *p++;
+			} else {
+				*q++ = byte;
+				p += 3;
+			}
+		} else {
+			*q++ = *p++;
+		}
+	}
+	*q = '\0';
+}
+
 static int respond_to_client(http_parser *parser)
 {
 	struct ws_client *client = parser->data;
 	struct http_parser_url url;
 	char *url_path;
-	size_t url_path_len;
 	char *str;
 	int fd;
 	int ret;
@@ -539,8 +576,9 @@ static int respond_to_client(http_parser *parser)
 	}
 
 	url_path = client->url + url.field_data[UF_PATH].off;
-	url_path_len = url.field_data[UF_PATH].len;
-	url_path[url_path_len] = '\0';
+	url_path[url.field_data[UF_PATH].len] = '\0';
+
+	decode_path(url_path);
 
 	str = strstr(url_path, "/..");
 	if (str && (str[3] == '/' || str[3] == '\0')) {
