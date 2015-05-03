@@ -556,12 +556,55 @@ static void decode_path(char *url_path)
 	*q = '\0';
 }
 
+static void remove_dot_components(char *url_path)
+{
+	char *p = url_path + 1, *q = url_path;
+
+	assert(url_path[0] == '/');
+
+	/*
+	 * Loop through the path components.
+	 *
+	 * Loop invariant: q points to the location where we should output a
+	 * slash followed by the next path component.
+	 */
+	while (1) {
+		char *sep = strchrnul(p, '/');
+		int len = sep - p;
+
+		if (len == 2 && p[0] == '.' && p[1] == '.') {
+			/* For "..", back up by one path component. */
+			if (q != url_path) {
+				while (*--q != '/')
+					;
+			}
+		} else if (!((len == 0 && *sep) || (len == 1 && p[0] == '.'))) {
+			/*
+			 * For ".", do nothing. For "", only add it if it's the
+			 * last component (e.g., add it in "/foo/", but not
+			 * "/foo//bar".
+			 */
+			*q++ = '/';
+			memmove(q, p, len);
+			q += len;
+		}
+
+		if (*sep) {
+			p = sep + 1;
+		} else {
+			break;
+		}
+	}
+	if (q == url_path)
+		*q++ = '/';
+	*q = '\0';
+}
+
 static int respond_to_client(http_parser *parser)
 {
 	struct ws_client *client = parser->data;
 	struct http_parser_url url;
 	char *url_path;
-	char *str;
 	int fd;
 	int ret;
 
@@ -579,17 +622,13 @@ static int respond_to_client(http_parser *parser)
 	url_path[url.field_data[UF_PATH].len] = '\0';
 
 	decode_path(url_path);
+	remove_dot_components(url_path);
 
-	str = strstr(url_path, "/..");
-	if (str && (str[3] == '/' || str[3] == '\0')) {
-		/*
-		 * Just forbid ".." anywhere for now. Either chroot or the
-		 * proposed O_BENEATH flag for open() would make this easier.
-		 */
-		return send_http_error(parser, 400, "Bad Request");
-	}
-
+	assert(!strstr(url_path, "/../"));
+	assert(!strstr(url_path, "/./"));
+	assert(!strstr(url_path, "//"));
 	assert(url_path[0] == '/');
+
 	url_path++;
 	fd = open(url_path, O_RDONLY | O_NOFOLLOW);
 	if (fd == -1) {
