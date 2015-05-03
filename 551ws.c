@@ -52,6 +52,7 @@ struct ws_client {
 	char *url;
 	size_t url_len;
 
+	int close;
 	int header_state;
 	struct header *headers;
 	size_t num_headers;
@@ -444,6 +445,7 @@ static int send_http_response(http_parser *parser, int status_code,
 	struct stat st = {};
 	int ret;
 	ssize_t sret;
+	int close_header;
 
 	t = time(NULL);
 	tm = gmtime(&t);
@@ -466,6 +468,10 @@ static int send_http_response(http_parser *parser, int status_code,
 		}
 	}
 
+	client->close = !http_should_keep_alive(parser);
+	close_header = client->close && (parser->http_major > 1 ||
+					 parser->http_minor >= 1);
+
 	ret = dprintf(client->fd, 
 		      "HTTP/%hu.%hu %d %s\r\n"
 		      "Date: %s\r\n"
@@ -476,7 +482,7 @@ static int send_http_response(http_parser *parser, int status_code,
 		      parser->http_major, parser->http_minor,
 		      status_code, status_msg, date,
 		      (intmax_t)st.st_size,
-		      http_should_keep_alive(parser) ? "" : "Connection: close\r\n"
+		      close_header ? "Connection: close\r\n" : ""
 		      );
 	if (ret < 0) {
 		perror("dprintf");
@@ -692,7 +698,7 @@ static void client_receive(struct ws_client *client)
 		return;
 	}
 
-	if (ret == 0)
+	if (ret == 0 || client->close)
 		remove_client(client);
 }
 
