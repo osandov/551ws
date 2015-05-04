@@ -152,8 +152,13 @@ static void log_request(http_parser *parser)
 #endif
 }
 
-static int parse_config(char *config_path, struct addrinfo **addr,
-			char **root_path_ret)
+/* parse_config() return value. */
+struct config {
+	struct addrinfo *addr;
+	char *root_path;
+};
+
+static int parse_config(char *config_path, struct config *config_ret)
 {
 	FILE *config_file = NULL;
 	char *node = NULL, *service = NULL, *root = NULL;
@@ -232,7 +237,7 @@ static int parse_config(char *config_path, struct addrinfo **addr,
 
 	wslog("getaddrinfo(\"%s:%s\")\n", node, service);
 
-	ret = getaddrinfo(node, service, &hints, addr);
+	ret = getaddrinfo(node, service, &hints, &config_ret->addr);
 	if (ret) {
 		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
 		ret = -1;
@@ -241,10 +246,11 @@ static int parse_config(char *config_path, struct addrinfo **addr,
 
 	wslog("open(\"%s\")\n", root);
 
-	*root_path_ret = realpath(root, NULL);
-	if (!*root_path_ret) {
+	config_ret->root_path = realpath(root, NULL);
+	if (!config_ret->root_path) {
 		perror("realpath");
 		ret = -1;
+		freeaddrinfo(config_ret->addr);
 		goto out;
 	}
 
@@ -704,6 +710,7 @@ static void client_receive(struct ws_client *client)
 
 int main(int argc, char **argv)
 {
+	struct config config;
 	struct addrinfo *addr = NULL;
 	sigset_t mask;
 	struct epoll_event event, events[10];
@@ -718,11 +725,13 @@ int main(int argc, char **argv)
 	}
 
 	/* Parse the configuration file. */
-	ret = parse_config(argv[1], &addr, &root_path);
+	ret = parse_config(argv[1], &config);
 	if (ret == -1) {
 		ret = EXIT_FAILURE;
 		goto out;
 	}
+	addr = config.addr;
+	root_path = config.root_path;
 	root_path_len = strlen(root_path);
 
 	/*
