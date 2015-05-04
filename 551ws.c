@@ -119,7 +119,7 @@ static inline void wslog(const char *format, ...)
 #endif
 }
 
-void log_accept(const struct sockaddr *addr, socklen_t addrlen, int fd)
+static void log_accept(const struct sockaddr *addr, socklen_t addrlen, int fd)
 {
 #ifndef NDEBUG
 	const struct sockaddr_in *addr_in;
@@ -136,6 +136,19 @@ void log_accept(const struct sockaddr *addr, socklen_t addrlen, int fd)
 		wslog("accepted %d from unknown family\n", fd);
 		break;
 	}
+#endif
+}
+
+static void log_request(http_parser *parser)
+{
+#ifndef NDEBUG
+	struct ws_client *client = parser->data;
+
+	wslog("\"%s %s\" from %d\n", http_method_str(parser->method),
+	      client->url, client->fd);
+	for (size_t i = 0; i < client->num_headers; i++)
+		wslog("header for %d \"%s: %s\"\n", client->fd,
+		      client->headers[i].field, client->headers[i].value);
 #endif
 }
 
@@ -606,7 +619,7 @@ static void remove_dot_components(char *url_path)
 	*q = '\0';
 }
 
-static int respond_to_client(http_parser *parser)
+static int on_message_complete(http_parser *parser)
 {
 	struct ws_client *client = parser->data;
 	struct http_parser_url url;
@@ -614,15 +627,15 @@ static int respond_to_client(http_parser *parser)
 	int fd;
 	int ret;
 
-	if (parser->method != HTTP_GET) {
+	log_request(parser);
+
+	if (parser->method != HTTP_GET)
 		return send_http_error(parser, 501, "Not Implemented");
-	}
 
 	ret = http_parser_parse_url(client->url, client->url_len,
 				    0, &url);
-	if (ret == -1 || !(url.field_set & (1 << UF_PATH))) {
+	if (ret == -1 || !(url.field_set & (1 << UF_PATH)))
 		return send_http_error(parser, 400, "Bad Request");
-	}
 
 	url_path = client->url + url.field_data[UF_PATH].off;
 	url_path[url.field_data[UF_PATH].len] = '\0';
@@ -655,19 +668,6 @@ static int respond_to_client(http_parser *parser)
 		perror("close");
 
 	return ret;
-}
-
-static int on_message_complete(http_parser *parser)
-{
-	struct ws_client *client = parser->data;
-
-	wslog("\"%s %s\" from %d\n", http_method_str(parser->method),
-	      client->url, client->fd);
-	for (size_t i = 0; i < client->num_headers; i++)
-		wslog("header for %d \"%s: %s\"\n", client->fd,
-		      client->headers[i].field, client->headers[i].value);
-
-	return respond_to_client(parser);
 }
 
 static void client_receive(struct ws_client *client)
