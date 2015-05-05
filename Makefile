@@ -1,7 +1,7 @@
 ALL_CFLAGS := -Wall -std=c99 -D_GNU_SOURCE -g $(CFLAGS)
 
 551ws: 551ws.o
-	$(CC) $(ALL_CFLAGS) -o $@ $^ -l http_parser
+	$(CC) $(ALL_CFLAGS) -o $@ $^ -lhttp_parser -lseccomp
 
 %.o: %.c
 	$(CC) $(ALL_CFLAGS) -o $@ -c $<

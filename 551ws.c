@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <seccomp.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -61,6 +62,9 @@ struct ws_client {
 /* Root directory of the web server. */
 static char *root_path = NULL;
 static size_t root_path_len = 0;
+
+/* Server file descriptor. */
+static int server_fd = -1;
 
 /* Epoll file descriptor. */
 static int epoll_fd = -1;
@@ -156,6 +160,7 @@ static void log_request(http_parser *parser)
 struct config {
 	struct addrinfo *addr;
 	char *root_path;
+	int seccomp;
 };
 
 static int parse_config(char *config_path, struct config *config_ret)
@@ -174,8 +179,11 @@ static int parse_config(char *config_path, struct config *config_ret)
 	config_file = fopen(config_path, "r");
 	if (!config_file) {
 		perror("fopen");
-		return EXIT_FAILURE;
+		return -1;
 	}
+
+	/* seccomp disabled by default. */
+	config_ret->seccomp = 0;
 
 	while ((sret = getline(&line, &n, config_file)) != -1) {
 		char *token;
@@ -216,6 +224,16 @@ static int parse_config(char *config_path, struct config *config_ret)
 				goto out;
 			}
 			root = strdup(token);
+		} else if (strcmp(line, "seccomp") == 0) {
+			if (strcmp(token, "true") == 0) {
+				config_ret->seccomp = 1;
+			} else if (strcmp(token, "false") == 0) {
+				config_ret->seccomp = 0;
+			} else {
+				fprintf(stderr, "invalid seccomp boolean\n");
+				ret = -1;
+				goto out;
+			}
 		} else {
 			fprintf(stderr, "invalid config\n");
 			ret = -1;
@@ -262,6 +280,110 @@ out:
 	if (config_file)
 		fclose(config_file);
 	return ret;
+}
+
+static int init_seccomp_sandbox(void)
+{
+	scmp_filter_ctx ctx = NULL;
+	int ret;
+
+	wslog("sandboxing with seccomp-bpf\n");
+
+	ctx = seccomp_init(SCMP_ACT_KILL);
+	if (!ctx)
+		return -1;
+
+	/* Allow exit_group() and rt_sigreturn(). */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(exit_group), 0);
+	if (ret < 0)
+		goto out;
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(rt_sigreturn), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow close(). */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(close), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow epoll_wait() on the epoll fd. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(epoll_wait), 1,
+			       SCMP_A0(SCMP_CMP_EQ, epoll_fd));
+	if (ret < 0)
+		goto out;
+
+	/* Allow accept() on the server fd. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept), 1,
+			       SCMP_A0(SCMP_CMP_EQ, server_fd));
+	if (ret < 0)
+		goto out;
+
+	/* Allow epoll_ctl() EPOLL_CTL_ADD on the epoll fd. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(epoll_ctl), 2,
+			       SCMP_A0(SCMP_CMP_EQ, epoll_fd),
+			       SCMP_A1(SCMP_CMP_EQ, EPOLL_CTL_ADD));
+	if (ret < 0)
+		goto out;
+
+	/* Allow read(). This is for the signal fd and the client fds. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(read), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow write(). This is for stderr and the client fds. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(write), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow open() with O_RDONLY. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(open), 1,
+			       SCMP_A1(SCMP_CMP_MASKED_EQ,
+				       O_RDONLY | O_RDWR | O_WRONLY,
+				       O_RDONLY));
+	if (ret < 0)
+		goto out;
+
+	/*
+	 * Allow fstat() and stat(). The latter is used for timezone stuff in
+	 * libc.
+	 */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(fstat), 0);
+	if (ret < 0)
+		goto out;
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(stat), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow lseek() for dprintf(). */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(lseek), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow sendfile(). */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(sendfile), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Allow mmap()/munmap() (for malloc?). TODO: limit to anonymous? */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
+	if (ret < 0)
+		goto out;
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(munmap), 0);
+	if (ret < 0)
+		goto out;
+
+	/* Load the seccomp context into the kernel. */
+	ret = seccomp_load(ctx);
+	if (ret < 0)
+		goto out;
+
+out:
+	seccomp_release(ctx);
+	if (ret) {
+		errno = -ret;
+		return -1;
+	}
+	return 0;
 }
 
 static void add_client(int client_fd)
@@ -530,7 +652,7 @@ static int send_http_error(http_parser *parser, int status_code,
 	ret = snprintf(buf, sizeof(buf), "%d.html", status_code);
 	assert(ret < sizeof(buf));
 
-	fd = open(buf, O_RDONLY);
+	fd = open(buf, O_RDONLY | O_NOFOLLOW);
 	if (fd == -1)
 		perror("open");
 
@@ -681,9 +803,9 @@ static void client_receive(struct ws_client *client)
 	ssize_t ret, parsed;
 	char buf[4096];
 
-	ret = recv(client->fd, buf, sizeof(buf), 0);
+	ret = read(client->fd, buf, sizeof(buf));
 	if (ret == -1) {
-		perror("recv");
+		perror("read");
 		remove_client(client);
 		return;
 	}
@@ -716,7 +838,7 @@ int main(int argc, char **argv)
 	struct epoll_event event, events[10];
 	int ret, opt;
 	ssize_t sret;
-	int signal_fd = -1, server_fd = -1;
+	int signal_fd = -1;
 	struct epoll_fd_data signal_data, server_data;
 
 	if (argc != 2) {
@@ -832,6 +954,16 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	/* Sandbox ourselves. */
+	if (config.seccomp) {
+		ret = init_seccomp_sandbox();
+		if (ret == -1) {
+			perror("seccomp");
+			ret = EXIT_FAILURE;
+			goto out;
+		}
+	}
+
 	/* Main event loop. */
 	for (;;) {
 		struct epoll_fd_data *data;
@@ -843,6 +975,8 @@ int main(int argc, char **argv)
 		ret = epoll_wait(epoll_fd, events,
 				 sizeof(events) / sizeof(events[0]), -1);
 		if (ret == -1) {
+			if (errno == EINTR)
+				continue;
 			perror("epoll_wait");
 			ret = EXIT_FAILURE;
 			goto out;
