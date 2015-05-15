@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <arpa/inet.h>
+#include <linux/if_alg.h>
 #include <netinet/in.h>
 #include <sys/epoll.h>
 #include <sys/sendfile.h>
@@ -68,6 +69,9 @@ static int server_fd = -1;
 
 /* Epoll file descriptor. */
 static int epoll_fd = -1;
+
+/* AF_ALG SHA-1 file descriptor. */
+static int sha_fd = -1;
 
 static struct ws_client *clients_head;
 static http_parser_settings parser_settings;
@@ -312,9 +316,13 @@ static int init_seccomp_sandbox(void)
 	if (ret < 0)
 		goto out;
 
-	/* Allow accept() on the server fd. */
+	/* Allow accept() on the server fd and the AF_ALG fd. */
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept), 1,
 			       SCMP_A0(SCMP_CMP_EQ, server_fd));
+	if (ret < 0)
+		goto out;
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(accept), 1,
+			       SCMP_A0(SCMP_CMP_EQ, sha_fd));
 	if (ret < 0)
 		goto out;
 
@@ -586,7 +594,8 @@ static int send_http_response(http_parser *parser, int status_code,
 	struct stat st = {};
 	int ret;
 	ssize_t sret;
-	int close_header;
+	int close_header, etag_header = 0;
+	char etag[43];
 
 	t = time(NULL);
 	tm = gmtime(&t);
@@ -613,18 +622,91 @@ static int send_http_response(http_parser *parser, int status_code,
 	close_header = client->close && (parser->http_major > 1 ||
 					 parser->http_minor >= 1);
 
+	if (status_code == 200) {
+		int opfd;
+		off_t offset = 0;
+		uint8_t buf[20];
+		size_t i;
+
+		/* Compute the SHA-1 of the file. */
+		opfd = accept(sha_fd, NULL, 0);
+		if (opfd == -1) {
+			perror("accept AF_ALG");
+			goto respond;
+		}
+		while (offset < st.st_size) {
+			sret = sendfile(opfd, fd, &offset, st.st_size - offset);
+			if (sret == -1) {
+				perror("sendfile AF_ALG");
+				close(opfd);
+				goto respond;
+			}
+		}
+		sret = read(opfd, buf, 20);
+		if (sret != sizeof(buf)) {
+			assert(sret == -1);
+			perror("read AF_ALG");
+			close(opfd);
+			goto respond;
+		}
+		close(opfd);
+
+		/* Format the ETag as a quoted hexadecimal string. */
+		etag[0] = '"';
+		for (i = 0; i < 20; i++)
+			sprintf(&etag[1 + 2 * i], "%02x", buf[i]);
+		etag[41] = '"';
+		etag[42] = '\0';
+		etag_header = 1;
+
+		/* Look for an If-None-Match header. */
+		for (i = 0; i < client->num_headers; i++) {
+			if (strcmp(client->headers[i].field, "If-None-Match") == 0)
+				break;
+		}
+
+		if (i < client->num_headers &&
+		    strcmp(client->headers[i].value, etag) == 0) {
+			/*
+			 * The If-None-Match matches the ETag, so the file
+			 * hasn't changed. Replace the 200 with a 304 and don't
+			 * send the file.
+			 */
+			status_code = 304;
+			status_msg = "Not Modified";
+			st.st_size = 0;
+			etag_header = 0;
+		}
+	}
+
+respond:
 	ret = dprintf(client->fd, 
 		      "HTTP/%hu.%hu %d %s\r\n"
-		      "Date: %s\r\n"
 		      "Server: 551ws\r\n"
-		      "Content-Length: %jd\r\n"
-		      "%s"
-		      "\r\n",
+		      "Date: %s\r\n"
+		      "Content-Length: %jd\r\n",
 		      parser->http_major, parser->http_minor,
 		      status_code, status_msg, date,
-		      (intmax_t)st.st_size,
-		      close_header ? "Connection: close\r\n" : ""
-		      );
+		      (intmax_t)st.st_size);
+	if (ret < 0) {
+		perror("dprintf");
+		return -1;
+	}
+	if (etag_header) {
+		ret = dprintf(client->fd, "ETag: %s\r\n", etag);
+		if (ret < 0) {
+			perror("dprintf");
+			return -1;
+		}
+	}
+	if (close_header) {
+		ret = dprintf(client->fd, "Connection: close\r\n");
+		if (ret < 0) {
+			perror("dprintf");
+			return -1;
+		}
+	}
+	ret = dprintf(client->fd, "\r\n");
 	if (ret < 0) {
 		perror("dprintf");
 		return -1;
@@ -840,6 +922,11 @@ int main(int argc, char **argv)
 	ssize_t sret;
 	int signal_fd = -1;
 	struct epoll_fd_data signal_data, server_data;
+	struct sockaddr_alg sha_sa = {
+		.salg_family = AF_ALG,
+		.salg_type = "hash",
+		.salg_name = "sha1",
+	};
 
 	if (argc != 2) {
 		fprintf(stderr, "Usage: %s CONFIG\n", argv[0]);
@@ -954,6 +1041,20 @@ int main(int argc, char **argv)
 		goto out;
 	}
 
+	/* Open an AF_ALG file descriptor for hashing files. */
+	sha_fd = socket(AF_ALG, SOCK_SEQPACKET, 0);
+	if (sha_fd == -1) {
+		perror("socket AF_ALG");
+		ret = EXIT_FAILURE;
+		goto out;
+	}
+	ret = bind(sha_fd, (struct sockaddr *)&sha_sa, sizeof(sha_sa));
+	if (ret == -1) {
+		perror("bind AF_ALG");
+		ret = EXIT_FAILURE;
+		goto out;
+	}
+
 	/* Sandbox ourselves. */
 	if (config.seccomp) {
 		ret = init_seccomp_sandbox();
@@ -1018,6 +1119,12 @@ int main(int argc, char **argv)
 
 out:
 	cleanup_clients();
+	if (sha_fd != -1) {
+		if (close(sha_fd) == -1) {
+			perror("close");
+			ret = EXIT_FAILURE;
+		}
+	}
 	if (epoll_fd != -1) {
 		if (close(epoll_fd) == -1) {
 			perror("close");
