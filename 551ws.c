@@ -394,7 +394,7 @@ static void add_client(int client_fd)
 
 	client = calloc(1, sizeof(*client));
 	if (!client) {
-		perror("malloc");
+		perror("calloc");
 		if (close(client_fd) == -1)
 			perror("close");
 		return;
@@ -577,7 +577,7 @@ static int on_header_value(http_parser *parser, const char *buf, size_t len)
 }
 
 static int send_http_response(http_parser *parser, int status_code,
-			       char *status_msg, int fd)
+			      char *status_msg, int fd)
 {
 	struct ws_client *client = parser->data;
 	time_t t;
@@ -643,7 +643,7 @@ static int send_http_response(http_parser *parser, int status_code,
 }
 
 static int send_http_error(http_parser *parser, int status_code,
-			    char *status_msg)
+			   char *status_msg)
 {
 	char buf[9];
 	int ret;
