@@ -245,7 +245,10 @@ static int init_seccomp_sandbox(void)
 	if (ret < 0)
 		goto out;
 
-	/* Allow mmap()/munmap() (for malloc?). TODO: limit to anonymous? */
+	/* Allow brk()/mmap()/munmap() for malloc. */
+	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(brk), 0);
+	if (ret < 0)
+		goto out;
 	ret = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(mmap), 0);
 	if (ret < 0)
 		goto out;
