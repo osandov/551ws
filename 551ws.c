@@ -76,10 +76,11 @@ static int sha_fd = -1;
 static struct ws_client *clients_head;
 static http_parser_settings parser_settings;
 
-static inline void wslog(const char *format, ...) __attribute__((format(printf, 1, 2)));
-static inline void wslog(const char *format, ...)
+static int log_level = 0;
+
+ __attribute__((format(printf, 2, 3)))
+static inline void wslog(int level, const char *format, ...)
 {
-#ifndef NDEBUG
 	static time_t prev_time = 0;
 	static struct timespec prev_tp = {};
 	time_t t;
@@ -89,6 +90,9 @@ static inline void wslog(const char *format, ...)
 	int len;
 	char buf[100] = "";
 	va_list ap;
+
+	if (log_level < level)
+		return;
 
 	t = time(NULL);
 	ret = clock_gettime(CLOCK_MONOTONIC, &tp);
@@ -124,40 +128,35 @@ static inline void wslog(const char *format, ...)
 	va_start(ap, format);
 	vfprintf(stderr, format, ap);
 	va_end(ap);
-#endif
 }
 
 static void log_accept(const struct sockaddr *addr, socklen_t addrlen, int fd)
 {
-#ifndef NDEBUG
 	const struct sockaddr_in *addr_in;
 
 	switch (addr->sa_family) {
 	case AF_INET:
 		addr_in = (const struct sockaddr_in *)addr;
-		wslog("accepted %d from %s:%" PRIu32 "\n", fd,
+		wslog(1, "accepted %d from %s:%" PRIu32 "\n", fd,
 		      inet_ntoa(addr_in->sin_addr), addr_in->sin_port);
 		break;
 	case AF_INET6:
 		break;
 	default:
-		wslog("accepted %d from unknown family\n", fd);
+		wslog(1, "accepted %d from unknown family\n", fd);
 		break;
 	}
-#endif
 }
 
 static void log_request(http_parser *parser)
 {
-#ifndef NDEBUG
 	struct ws_client *client = parser->data;
 
-	wslog("\"%s %s\" from %d\n", http_method_str(parser->method),
+	wslog(1, "\"%s %s\" from %d\n", http_method_str(parser->method),
 	      client->url, client->fd);
 	for (size_t i = 0; i < client->num_headers; i++)
-		wslog("header for %d \"%s: %s\"\n", client->fd,
+		wslog(1, "header for %d \"%s: %s\"\n", client->fd,
 		      client->headers[i].field, client->headers[i].value);
-#endif
 }
 
 static int init_seccomp_sandbox(void)
@@ -165,7 +164,7 @@ static int init_seccomp_sandbox(void)
 	scmp_filter_ctx ctx = NULL;
 	int ret;
 
-	wslog("sandboxing with seccomp-bpf\n");
+	wslog(0, "sandboxing with seccomp-bpf\n");
 
 	ctx = seccomp_init(SCMP_ACT_KILL);
 	if (!ctx)
@@ -322,7 +321,7 @@ static void cleanup_client_http(struct ws_client *client)
 
 static void remove_client(struct ws_client *client)
 {
-	wslog("removing client %d\n", client->fd);
+	wslog(1, "removing client %d\n", client->fd);
 
 	if (close(client->fd) == -1)
 		perror("close");
@@ -798,6 +797,8 @@ static void usage(int error)
 		"Security options:\n"
 		"  -S, --seccomp             enable seccomp-bpf sandbox (recommended)\n"
 		"Miscellaneous:\n"
+		"  -d                        increase the debug level by one\n"
+		"  --debug-level=DEBUG_LEVEL set the debug level to DEBUG_LEVEL\n"
 		"  -h, --help                display this help text and exit\n",
 		program_invocation_name);
 	exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
@@ -826,23 +827,18 @@ int main(int argc, char **argv)
 	/* Parse command-line options. */
 	while (1) {
 		static struct option long_options[] = {
-			{"help", no_argument, NULL, 'h'},
-			{"listen", required_argument, NULL, 'l'},
-			{"root", required_argument, NULL, 'r'},
-			{"seccomp", no_argument, NULL, 'S'},
+			{"listen",	required_argument,	NULL,	'l'},
+			{"root",	required_argument,	NULL,	'r'},
+			{"seccomp",	no_argument,		NULL,	'S'},
+			{"debug-level",	required_argument,	NULL,	'd'},
+			{"help",	no_argument, 		NULL,	'h'},
 		};
 		int c;
 
-		c = getopt_long(argc, argv, "hl:r:S", long_options, NULL);
+		c = getopt_long(argc, argv, "l:r:Sdh", long_options, NULL);
 		if (c == -1)
 			break;
 		switch (c) {
-		case 'h':
-			free(node);
-			free(service);
-			free(root_path);
-			usage(0);
-			break;
 		case 'l':
 			free(node);
 			node = NULL;
@@ -865,6 +861,18 @@ int main(int argc, char **argv)
 		case 'S':
 			seccomp = 1;
 			break;
+		case 'd':
+			if (optarg)
+				log_level = atoi(optarg);
+			else
+				log_level++;
+			break;
+		case 'h':
+			free(node);
+			free(service);
+			free(root_path);
+			usage(0);
+			break;
 		default:
 usage_err:
 			free(node);
@@ -883,6 +891,7 @@ usage_err:
 	}
 
 	/* Resolve the listen address. */
+	wslog(0, "addr = %s:%s\n", node, service);
 	ret = getaddrinfo(node, service, &hints, &addr);
 	free(node);
 	free(service);
@@ -896,6 +905,7 @@ usage_err:
 	 * Chdir to the root path.
 	 * TODO: chroot would be better, but that requires CAP_SYS_CHROOT.
 	 */
+	wslog(0, "root = %s\n", root_path);
 	ret = chdir(root_path);
 	if (ret == -1) {
 		perror("chdir");
@@ -928,7 +938,8 @@ usage_err:
 	}
 
 	/* Create and bind the server socket and start listening. */
-	wslog("socket()\n");
+
+	wslog(0, "starting server...\n");
 
 	server_fd = socket(addr->ai_family, SOCK_STREAM, addr->ai_protocol);
 	if (server_fd == -1) {
@@ -944,16 +955,12 @@ usage_err:
 		goto out;
 	}
 
-	wslog("bind()\n");
-
 	ret = bind(server_fd, addr->ai_addr, addr->ai_addrlen);
 	if (ret == -1) {
 		perror("bind");
 		ret = EXIT_FAILURE;
 		goto out;
 	}
-
-	wslog("listen()\n");
 
 	ret = listen(server_fd, SOMAXCONN);
 	if (ret == -1) {
@@ -1013,6 +1020,8 @@ usage_err:
 			goto out;
 		}
 	}
+
+	wslog(0, "ready\n");
 
 	/* Main event loop. */
 	for (;;) {
