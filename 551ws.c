@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <netdb.h>
 #include <seccomp.h>
 #include <signal.h>
@@ -61,8 +62,7 @@ struct ws_client {
 };
 
 /* Root directory of the web server. */
-static char *root_path = NULL;
-static size_t root_path_len = 0;
+static char *root_path;
 
 /* Server file descriptor. */
 static int server_fd = -1;
@@ -158,132 +158,6 @@ static void log_request(http_parser *parser)
 		wslog("header for %d \"%s: %s\"\n", client->fd,
 		      client->headers[i].field, client->headers[i].value);
 #endif
-}
-
-/* parse_config() return value. */
-struct config {
-	struct addrinfo *addr;
-	char *root_path;
-	int seccomp;
-};
-
-static int parse_config(char *config_path, struct config *config_ret)
-{
-	FILE *config_file = NULL;
-	char *node = NULL, *service = NULL, *root = NULL;
-	int ret;
-	ssize_t sret;
-	struct addrinfo hints = {
-		.ai_family = AF_UNSPEC,
-		.ai_socktype = SOCK_STREAM,
-	};
-	char *line = NULL;
-	size_t n = 0;
-
-	config_file = fopen(config_path, "r");
-	if (!config_file) {
-		perror("fopen");
-		return -1;
-	}
-
-	/* seccomp disabled by default. */
-	config_ret->seccomp = 0;
-
-	while ((sret = getline(&line, &n, config_file)) != -1) {
-		char *token;
-
-		if (sret == 0)
-			continue;
-
-		if (line[sret - 1] == '\n')
-			line[sret - 1] = '\0';
-
-		token = strchr(line, '\t');
-		if (!token) {
-			fprintf(stderr, "invalid config line\n");
-			ret = -1;
-			goto out;
-		}
-		*token++ = '\0';
-
-		if (strcmp(line, "listen") == 0) {
-			free(node);
-			node = NULL;
-			free(service);
-			service = NULL;
-			ret = sscanf(token, "%m[^:]:%ms", &node, &service);
-			if (ret != 2) {
-				if (ferror(config_file))
-					perror("fscanf");
-				else
-					fprintf(stderr, "invalid listen address\n");
-				ret = -1;
-				goto out;
-			}
-		} else if (strcmp(line, "root") == 0) {
-			free(root);
-			if (strlen(token) == 0) {
-				fprintf(stderr, "invalid root path\n");
-				ret = -1;
-				goto out;
-			}
-			root = strdup(token);
-		} else if (strcmp(line, "seccomp") == 0) {
-			if (strcmp(token, "true") == 0) {
-				config_ret->seccomp = 1;
-			} else if (strcmp(token, "false") == 0) {
-				config_ret->seccomp = 0;
-			} else {
-				fprintf(stderr, "invalid seccomp boolean\n");
-				ret = -1;
-				goto out;
-			}
-		} else {
-			fprintf(stderr, "invalid config\n");
-			ret = -1;
-			goto out;
-		}
-	}
-
-	if (!node || !service) {
-		fprintf(stderr, "missing listen address\n");
-		ret = -1;
-		goto out;
-	}
-
-	if (!root) {
-		fprintf(stderr, "missing root path\n");
-		ret = -1;
-		goto out;
-	}
-
-	wslog("getaddrinfo(\"%s:%s\")\n", node, service);
-
-	ret = getaddrinfo(node, service, &hints, &config_ret->addr);
-	if (ret) {
-		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
-		ret = -1;
-		goto out;
-	}
-
-	wslog("open(\"%s\")\n", root);
-
-	config_ret->root_path = realpath(root, NULL);
-	if (!config_ret->root_path) {
-		perror("realpath");
-		ret = -1;
-		freeaddrinfo(config_ret->addr);
-		goto out;
-	}
-
-out:
-	free(root);
-	free(service);
-	free(node);
-	free(line);
-	if (config_file)
-		fclose(config_file);
-	return ret;
 }
 
 static int init_seccomp_sandbox(void)
@@ -912,10 +786,31 @@ static void client_receive(struct ws_client *client)
 		remove_client(client);
 }
 
+static void usage(int error)
+{
+	fprintf(error ? stderr : stdout,
+		"Usage: %s -l ADDR:PORT -r ROOT_PATH [OPTION]...\n"
+		"Run a minimal web server.\n"
+		"\n"
+		"Server options:\n"
+		"  -l, --listen=ADDR:PORT    listen on address ADDR, port PORT (required)\n"
+		"  -r, --root=ROOT_PATH      serve files from the directory ROOT_PATH (required)\n"
+		"Security options:\n"
+		"  -S, --seccomp             enable seccomp-bpf sandbox (recommended)\n"
+		"Miscellaneous:\n"
+		"  -h, --help                display this help text and exit\n",
+		program_invocation_name);
+	exit(error ? EXIT_FAILURE : EXIT_SUCCESS);
+}
+
 int main(int argc, char **argv)
 {
-	struct config config;
-	struct addrinfo *addr = NULL;
+	char *node = NULL, *service = NULL;
+	struct addrinfo hints = {
+		.ai_family = AF_UNSPEC,
+		.ai_socktype = SOCK_STREAM,
+	}, *addr = NULL;
+	int seccomp = 0;
 	sigset_t mask;
 	struct epoll_event event, events[10];
 	int ret, opt;
@@ -928,20 +823,74 @@ int main(int argc, char **argv)
 		.salg_name = "sha1",
 	};
 
-	if (argc != 2) {
-		fprintf(stderr, "Usage: %s CONFIG\n", argv[0]);
-		return EXIT_FAILURE;
+	/* Parse command-line options. */
+	while (1) {
+		static struct option long_options[] = {
+			{"help", no_argument, NULL, 'h'},
+			{"listen", required_argument, NULL, 'l'},
+			{"root", required_argument, NULL, 'r'},
+			{"seccomp", no_argument, NULL, 'S'},
+		};
+		int c;
+
+		c = getopt_long(argc, argv, "hl:r:S", long_options, NULL);
+		if (c == -1)
+			break;
+		switch (c) {
+		case 'h':
+			free(node);
+			free(service);
+			free(root_path);
+			usage(0);
+			break;
+		case 'l':
+			free(node);
+			node = NULL;
+			free(service);
+			service = NULL;
+			ret = sscanf(optarg, "%m[^:]:%ms", &node, &service);
+			if (ret != 2) {
+				if (ret == -1) {
+					perror("sscanf");
+					exit(EXIT_FAILURE);
+				}
+				fprintf(stderr, "invalid listen address\n");
+				goto usage_err;
+			}
+			break;
+		case 'r':
+			free(root_path);
+			root_path = strdup(optarg);
+			break;
+		case 'S':
+			seccomp = 1;
+			break;
+		default:
+usage_err:
+			free(node);
+			free(service);
+			free(root_path);
+			usage(1);
+		}
+	}
+	if (!node || !service) {
+		fprintf(stderr, "listen address is required\n");
+		goto usage_err;
+	}
+	if (!root_path) {
+		fprintf(stderr, "root path is required\n");
+		goto usage_err;
 	}
 
-	/* Parse the configuration file. */
-	ret = parse_config(argv[1], &config);
-	if (ret == -1) {
+	/* Resolve the listen address. */
+	ret = getaddrinfo(node, service, &hints, &addr);
+	free(node);
+	free(service);
+	if (ret) {
+		fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(ret));
 		ret = EXIT_FAILURE;
 		goto out;
 	}
-	addr = config.addr;
-	root_path = config.root_path;
-	root_path_len = strlen(root_path);
 
 	/*
 	 * Chdir to the root path.
@@ -1056,7 +1005,7 @@ int main(int argc, char **argv)
 	}
 
 	/* Sandbox ourselves. */
-	if (config.seccomp) {
+	if (seccomp) {
 		ret = init_seccomp_sandbox();
 		if (ret == -1) {
 			perror("seccomp");
