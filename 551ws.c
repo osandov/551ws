@@ -84,7 +84,7 @@ static inline void wslog(int level, const char *format, ...)
 	static time_t prev_time = 0;
 	static struct timespec prev_tp = {};
 	time_t t;
-	struct tm *tm;
+	struct tm tm;
 	struct timespec tp;
 	int ret;
 	int len;
@@ -100,12 +100,11 @@ static inline void wslog(int level, const char *format, ...)
 		perror("clock_gettime");
 		exit(EXIT_FAILURE);
 	}
-	tm = localtime(&t);
-	if (!tm) {
-		perror("localtime");
+	if (!localtime_r(&t, &tm)) {
+		perror("localtime_r");
 		exit(EXIT_FAILURE);
 	}
-	ret = strftime(buf, sizeof(buf), "%b%d %T", tm);
+	ret = strftime(buf, sizeof(buf), "%b%d %T", &tm);
 	if (ret == 0) {
 		perror("strftime");
 		exit(EXIT_FAILURE);
@@ -465,7 +464,7 @@ static int send_http_response(http_parser *parser, int status_code,
 {
 	struct ws_client *client = parser->data;
 	time_t t;
-	struct tm *tm;
+	struct tm tm;
 	char date[30];
 	struct stat st = {};
 	int ret;
@@ -474,13 +473,12 @@ static int send_http_response(http_parser *parser, int status_code,
 	char etag[43];
 
 	t = time(NULL);
-	tm = gmtime(&t);
-	if (!tm) {
-		perror("gmtime");
+	if (!gmtime_r(&t, &tm)) {
+		perror("gmtime_r");
 		abort();
 	}
 
-	ret = strftime(date, sizeof(date), "%a, %d %b %Y %T %Z", tm);
+	ret = strftime(date, sizeof(date), "%a, %d %b %Y %T %Z", &tm);
 	if (ret == 0) {
 		perror("strftime");
 		abort();
