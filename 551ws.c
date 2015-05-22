@@ -505,7 +505,7 @@ static int send_http_response(http_parser *parser, int status_code,
 		size_t i;
 
 		/* Compute the SHA-1 of the file. */
-		opfd = accept(sha_fd, NULL, 0);
+		opfd = accept(sha_fd, NULL, NULL);
 		if (opfd == -1) {
 			perror("accept AF_ALG");
 			goto respond;
