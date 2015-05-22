@@ -1,2 +1,3 @@
 /551ws
-*.o
+/551record.so
+/551replay.so

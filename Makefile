@@ -1,11 +1,16 @@
-ALL_CFLAGS := -Wall -std=c99 -D_GNU_SOURCE -g $(CFLAGS)
+ALL_CFLAGS := -Wall -Werror -std=c99 -D_GNU_SOURCE -g $(CFLAGS)
 
-551ws: 551ws.o
+all: 551ws 551record.so 551replay.so
+
+551ws: 551ws.c
 	$(CC) $(ALL_CFLAGS) -o $@ $^ -lhttp_parser -lseccomp
 
-%.o: %.c
-	$(CC) $(ALL_CFLAGS) -o $@ -c $<
+551record.so: 551record.c 551r2.h
+	$(CC) $(ALL_CFLAGS) -shared -fpic -I. -o $@ $< -ldl
+
+551replay.so: 551replay.c 551r2.h
+	$(CC) $(ALL_CFLAGS) -shared -fpic -I. -o $@ $< -ldl
 
 .PHONY: clean
 clean:
-	rm -f 551ws.o 551ws
+	rm -f 551ws 551record.so 551replay.so
