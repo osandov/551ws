@@ -951,7 +951,7 @@ usage_err:
 		goto out;
 	}
 	opt = 1;
-	ret = setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+	ret = setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &opt, sizeof(opt));
 	if (ret == -1) {
 		perror("setsockopt");
 		ret = EXIT_FAILURE;
