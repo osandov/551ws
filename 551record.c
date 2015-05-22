@@ -22,7 +22,7 @@ static ssize_t (*orig_read)(int, void *, size_t);
 static ssize_t (*orig_write)(int, const void *, size_t);
 static int (*orig_open)(const char *, int, ...);
 static int (*orig_close)(int);
-static int (*orig_fstat)(int, struct stat *);
+static int (*orig_fxstat)(int, int, struct stat *);
 
 static void log_write(const void *buf, size_t count)
 {
@@ -67,7 +67,7 @@ static void init(void)
 	orig_write = dlsym(RTLD_NEXT, "write");
 	orig_open = dlsym(RTLD_NEXT, "open");
 	orig_close = dlsym(RTLD_NEXT, "close");
-	orig_fstat = dlsym(RTLD_NEXT, "fstat");
+	orig_fxstat = dlsym(RTLD_NEXT, "__fxstat");
 	error = dlerror();
 	if (error) {
 		fprintf(stderr, "%s\n", error);
@@ -139,10 +139,14 @@ struct tm *localtime_r(const time_t *timep, struct tm *result)
 	struct tm *res;
 
 	res = orig_localtime_r(timep, &log.res);
-	if (res)
+	if (res) {
 		*result = *res;
+		log.tm_zone_len = strlen(log.res.tm_zone) + 1;
+	}
 
 	log_write(&log, sizeof(log));
+	if (res)
+		log_write(log.res.tm_zone, log.tm_zone_len);
 
 	return res;
 }
@@ -156,10 +160,14 @@ struct tm *gmtime_r(const time_t *timep, struct tm *result)
 	struct tm *res;
 
 	res = orig_gmtime_r(timep, &log.res);
-	if (res)
+	if (res) {
 		*result = *res;
+		log.tm_zone_len = strlen(log.res.tm_zone) + 1;
+	}
 
 	log_write(&log, sizeof(log));
+	if (res)
+		log_write(log.res.tm_zone, log.tm_zone_len);
 
 	return res;
 }
@@ -327,10 +335,10 @@ int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen)
 		log.ret = -errno;
 	} else {
 		log.ret = ret;
-		if (addr) {
+		if (addr)
 			memcpy(&log.addr, addr, *addrlen);
+		if (addrlen)
 			log.addrlen_out = *addrlen;
-		}
 	}
 
 	log_write(&log, sizeof(log));
@@ -493,15 +501,17 @@ int close(int fd)
 	return ret;
 }
 
-int fstat(int fd, struct stat *buf)
+/* See /usr/include/sys/stat.h; fstat is an inline wrapper around __fxstat. */
+int __fxstat(int ver, int fd, struct stat *buf)
 {
-	struct fstat_log log = {
-		LOG_fstat,
+	struct fxstat_log log = {
+		LOG_fxstat,
+		ver,
 		fd,
 	};
 	int ret;
 
-	ret = orig_fstat(fd, buf);
+	ret = orig_fxstat(ver, fd, buf);
 	if (ret == -1) {
 		log.ret = -errno;
 	} else {

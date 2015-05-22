@@ -41,7 +41,7 @@ enum {
 	LOG_write,
 	LOG_open,
 	LOG_close,
-	LOG_fstat,
+	LOG_fxstat,
 	LOG_sendfile,
 	LOG_dprintf,
 };
@@ -67,6 +67,9 @@ struct localtime_r_log {
 	time_t time;
 
 	struct tm res;
+	size_t tm_zone_len;
+
+	/* tm_zone */
 };
 
 struct gmtime_r_log {
@@ -75,6 +78,9 @@ struct gmtime_r_log {
 	time_t time;
 
 	struct tm res;
+	size_t tm_zone_len;
+
+	/* tm_zone */
 };
 
 struct getaddrinfo_log {
@@ -91,6 +97,16 @@ struct getaddrinfo_log {
 	 */
 
 	/* node, service */
+};
+
+struct chdir_log {
+	int func;
+
+	size_t path_len;
+
+	int ret;
+
+	/* path */
 };
 
 struct sigprocmask_log {
@@ -111,16 +127,6 @@ struct signalfd_log {
 	int flags;
 
 	int ret;
-};
-
-struct chdir_log {
-	int func;
-
-	size_t path_len;
-
-	int ret;
-
-	/* path */
 };
 
 struct socket_log {
@@ -235,9 +241,10 @@ struct close_log {
 	int ret;
 };
 
-struct fstat_log {
+struct fxstat_log {
 	int func;
 
+	int ver;
 	int fd;
 
 	int ret;
